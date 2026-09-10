@@ -296,7 +296,12 @@ int ImGuiOverWindows::start()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     contextReady = true;
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGuiIO& io = ImGui::GetIO();
+    // The program directory is an immutable, signed update payload.  Dear
+    // ImGui otherwise writes its default relative imgui.ini there during a
+    // trial run, which makes the launcher reject that otherwise valid build
+    // on its next integrity check.
+    io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     // WinUI owns the single controller reader and dispatches contextual actions.
     // The click-through drawing surface must not navigate from game presses.
