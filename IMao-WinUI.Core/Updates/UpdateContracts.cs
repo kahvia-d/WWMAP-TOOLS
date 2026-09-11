@@ -82,11 +82,23 @@ public sealed record ResourcePackage
     public long Size { get; init; }
     public string Sha256 { get; init; } = "";
     public List<ResourceFile> Files { get; init; } = new();
+    // Optional for compatibility with published schema-v1 catalogs.  Each archive
+    // contains exactly the named resource file and is independently signed by the
+    // catalog envelope.
+    public List<ResourceFileArchive>? FileArchives { get; init; }
 }
 
 public sealed record ResourceFile
 {
     public string Path { get; init; } = "";
+    public long Size { get; init; }
+    public string Sha256 { get; init; } = "";
+}
+
+public sealed record ResourceFileArchive
+{
+    public string Path { get; init; } = "";
+    public string Url { get; init; } = "";
     public long Size { get; init; }
     public string Sha256 { get; init; } = "";
 }

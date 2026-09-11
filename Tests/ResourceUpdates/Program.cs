@@ -401,6 +401,26 @@ await Test("unchanged bundled package is verified and reused without download or
     Equal(2, f.Network.Requests.Count); False(f.Network.Requests.Contains(data.Url)); False(Directory.Exists(Path.Combine(f.Root, "packages/map-data")));
     var next = f.NewSnapshots(); await next.InitializeAsync(); Equal(bundleDirectory, next.Current.MapDataRoot); await next.ReportHealthyAsync("snapshot-2");
 });
+await Test("file archives download only the changed file and reuse an older package version", async () =>
+{
+    using var f = New(); await f.Initialize();
+    var first = f.MakeMultiFilePackage("lahai-tile", "tile", "2026.9.9.2", ("manifest.json", "old"), ("features.imf", "large-stable"), ("features.yml", "large-stable-yml"));
+    var firstCatalog = f.Catalog() with { Resources = [f.Catalog().Resources[0] with { Packages = [f.Catalog().Resources[0].Packages[0], first] }] };
+    f.Publish(firstCatalog); await f.Updates.CheckAsync(); await f.Updates.InstallAsync();
+    var current = f.NewSnapshots(); await current.InitializeAsync(); await current.ReportHealthyAsync("snapshot-2"); using var updater = f.NewUpdates(current);
+    var changed = f.MakeMultiFilePackage("lahai-tile", "tile", "2026.9.9.3", ("manifest.json", "new"), ("features.imf", "large-stable"), ("features.yml", "large-stable-yml"));
+    var next = f.Catalog(3) with { Resources = [f.Catalog(3).Resources[0] with { Packages = [firstCatalog.Resources[0].Packages[0], changed] }] };
+    f.Publish(next); f.Network.Requests.Clear(); await updater.CheckAsync(); await updater.InstallAsync();
+    Equal(2, f.Network.Requests.Count); True(f.Network.Requests.Contains(changed.FileArchives!.Single(a => a.Path == "manifest.json").Url)); False(f.Network.Requests.Contains(changed.Url));
+    False(f.Network.Requests.Contains(changed.FileArchives!.Single(a => a.Path == "features.imf").Url));
+});
+await Test("file archive rejects an unexpected path without staging", async () =>
+{
+    using var f = New(); await f.Initialize(); var package = f.MakePackage("map-data", "map-data", "2026.9.9.2", "changed");
+    var archive = package.FileArchives!.Single(); f.Network.Routes[archive.Url] = f.ZipForTest(("wrong.json", Encoding.UTF8.GetBytes("changed"), 0));
+    var catalog = f.Catalog() with { Resources = [f.Catalog().Resources[0] with { Packages = [package] }] }; f.Publish(catalog); await f.Updates.CheckAsync();
+    await ThrowsAsync<InvalidDataException>(() => f.Updates.InstallAsync()); False(f.Snapshots.HasPending);
+});
 await Test("same-baseline moved app rebinds proven bundled payload and native snapshot paths", async () =>
 {
     using var f = New(); var data = f.MakePackage("map-data", "map-data", "2026.9.9.1", "bundled-data");
@@ -578,8 +598,28 @@ sealed class Fixture : IDisposable
         if (malformed == "missing") entries.Clear();
         if (malformed == "extra") entries.Add(("extra.json", [1], 0));
         var zip = Zip(entries); var url = $"https://github.com/kahvia-d/WWMAP-TOOLS/releases/download/{version}/{id}.zip"; Network.Routes[url] = zip;
-        return new ResourcePackage { Id = id, Kind = kind, Version = version, Url = url, Size = zip.Length, Sha256 = Hash(zip), Files = [new ResourceFile { Path = name, Size = bytes.Length, Sha256 = Hash(bytes) }] };
+        var file = new ResourceFile { Path = name, Size = bytes.Length, Sha256 = Hash(bytes) };
+        if (malformed is not null) return new ResourcePackage { Id = id, Kind = kind, Version = version, Url = url, Size = zip.Length, Sha256 = Hash(zip), Files = [file] };
+        var package = MakePackageFromEntries(id, kind, version, entries, [file], zip, url);
+        return package;
     }
+    public ResourcePackage MakeMultiFilePackage(string id, string kind, string version, params (string name, string text)[] files)
+    {
+        var entries = files.Select(x => (x.name, Encoding.UTF8.GetBytes(x.text), 0)).ToList(); var zip = Zip(entries); var url = $"https://github.com/kahvia-d/WWMAP-TOOLS/releases/download/{version}/{id}.zip";
+        return MakePackageFromEntries(id, kind, version, entries, entries.Select(x => new ResourceFile { Path = x.name, Size = x.Item2.Length, Sha256 = Hash(x.Item2) }).ToList(), zip, url);
+    }
+    private ResourcePackage MakePackageFromEntries(string id, string kind, string version, List<(string, byte[], int)> entries, List<ResourceFile> files, byte[] zip, string url)
+    {
+        Network.Routes[url] = zip;
+        var archives = new List<ResourceFileArchive>();
+        foreach (var file in files)
+        {
+            var item = entries.Single(e => e.Item1 == file.Path); var bytes = Zip([(file.Path, item.Item2, 0)]); var fileUrl = $"https://github.com/kahvia-d/WWMAP-TOOLS/releases/download/{version}/file-{file.Sha256.ToLowerInvariant()}.zip";
+            Network.Routes[fileUrl] = bytes; archives.Add(new() { Path = file.Path, Url = fileUrl, Size = bytes.Length, Sha256 = Hash(bytes) });
+        }
+        return new ResourcePackage { Id = id, Kind = kind, Version = version, Url = url, Size = zip.Length, Sha256 = Hash(zip), Files = files, FileArchives = archives };
+    }
+    public byte[] ZipForTest(params (string name, byte[] bytes, int attributes)[] entries) => Zip(entries);
     public byte[] Sign(UpdateCatalog catalog)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(catalog, UpdateJson.Options);

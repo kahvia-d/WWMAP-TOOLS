@@ -216,43 +216,57 @@ public sealed class UpdateService : IDisposable
             else if (Directory.Exists(target)) await VerifyInstalledAsync(target, package, ct).ConfigureAwait(false);
             else needed.Add(package);
         }
-        var requiredBytes = checked(needed.Sum(p => checked(p.Size + p.Files.Sum(f => f.Size))) + 64L * 1024 * 1024);
+        var plans = offline is null ? await Task.WhenAll(needed.Select(p => BuildPlanAsync(p, ct))).ConfigureAwait(false) : [];
+        var requiredBytes = checked(needed.Sum(p => p.Files.Sum(f => f.Size)) + plans.Sum(p => p.DownloadBytes) + 64L * 1024 * 1024);
         if (_freeSpace() < requiredBytes) throw new IOException("磁盘空间不足，无法安全安装资源更新。");
         var work = Path.Combine(_snapshots.Root, "staging", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(work);
         long completed = 0;
-        var total = needed.Sum(p => p.Size);
+        var total = offline is not null ? needed.Sum(p => p.Size) : plans.Sum(p => p.DownloadBytes);
         try
         {
-            foreach (var package in needed)
+            for (var packageIndex = 0; packageIndex < needed.Count; packageIndex++)
             {
+                var package = needed[packageIndex];
                 ct.ThrowIfCancellationRequested();
-                var zipPath = Path.Combine(work, package.Id + ".zip");
-                await using (var output = new FileStream(zipPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous))
+                var plan = offline is null ? plans[packageIndex] : null;
+                if (plan is not null && plan.UseFiles)
                 {
-                    if (offline is not null)
+                    progress?.Report(new UpdateProgress($"组装资源（复用 {plan.Reused.Count} 个文件）", completed, total));
+                    var unpacked = Path.Combine(work, package.Id);
+                    Directory.CreateDirectory(unpacked);
+                    foreach (var item in plan.Reused)
                     {
-                        await using var source = offline["packages/" + package.Id + "-" + package.Version + ".zip"].Open();
-                        await CopyVerifiedAsync(source, output, package.Size, package.Sha256, n => progress?.Report(new UpdateProgress("导入资源", completed + n, total)), ct).ConfigureAwait(false);
+                        var targetFile = UpdateStorage.SafeChild(unpacked, item.File.Path);
+                        Directory.CreateDirectory(Path.GetDirectoryName(targetFile)!);
+                        await CopyLocalVerifiedAsync(item.SourcePath, targetFile, item.File, ct).ConfigureAwait(false);
                     }
-                    else
+                    foreach (var item in plan.Downloads)
                     {
-                        using var response = await GetResponseAsync(new Uri(package.Url), ct).ConfigureAwait(false);
-                        if (response.Content.Headers.ContentLength is long actualLength && actualLength != package.Size) throw new InvalidDataException("下载文件长度与发布清单不符。");
+                        using var response = await GetResponseAsync(new Uri(item.Archive.Url), ct).ConfigureAwait(false);
+                        if (response.Content.Headers.ContentLength is long actualLength && actualLength != item.Archive.Size) throw new InvalidDataException("资源文件附件长度与清单不符。");
                         await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-                        await CopyVerifiedAsync(source, output, package.Size, package.Sha256, n => progress?.Report(new UpdateProgress("下载资源", completed + n, total)), ct).ConfigureAwait(false);
+                        var archivePath = Path.Combine(work, Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(package.Id + item.File.Path))) + ".zip");
+                        await using (var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous))
+                            await CopyVerifiedAsync(source, output, item.Archive.Size, item.Archive.Sha256, n => progress?.Report(new UpdateProgress("下载资源文件", completed + n, total)), ct).ConfigureAwait(false);
+                        completed += item.Archive.Size;
+                        await ExtractSingleFileAsync(archivePath, unpacked, item.File, ct).ConfigureAwait(false);
                     }
+                    await UpdateStorage.VerifyDirectoryAsync(unpacked, package.Files, ct).ConfigureAwait(false);
+                    await CommitPackageAsync(unpacked, package, ct).ConfigureAwait(false);
                 }
-                completed += package.Size;
-                progress?.Report(new UpdateProgress("验证并解压资源", completed, total));
-                var unpacked = Path.Combine(work, package.Id);
-                await ExtractPackageAsync(zipPath, unpacked, package, ct).ConfigureAwait(false);
-                var target = PackageDirectory(package);
-                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                UpdateStorage.RejectLink(Path.GetDirectoryName(target)!);
-                ct.ThrowIfCancellationRequested();
-                await UpdateStorage.WriteAsync(target + ".receipt.json", package, ct).ConfigureAwait(false);
-                await UpdateStorage.MoveDirectoryAsync(unpacked, target, ct).ConfigureAwait(false);
+                else
+                {
+                    var zipPath = Path.Combine(work, package.Id + ".zip");
+                    await using (var output = new FileStream(zipPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous))
+                    {
+                        if (offline is not null) { await using var source = offline["packages/" + package.Id + "-" + package.Version + ".zip"].Open(); await CopyVerifiedAsync(source, output, package.Size, package.Sha256, n => progress?.Report(new UpdateProgress("导入资源", completed + n, total)), ct).ConfigureAwait(false); }
+                        else { using var response = await GetResponseAsync(new Uri(package.Url), ct).ConfigureAwait(false); if (response.Content.Headers.ContentLength is long actualLength && actualLength != package.Size) throw new InvalidDataException("下载文件长度与发布清单不符。"); await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false); await CopyVerifiedAsync(source, output, package.Size, package.Sha256, n => progress?.Report(new UpdateProgress("下载资源", completed + n, total)), ct).ConfigureAwait(false); }
+                    }
+                    completed += package.Size;
+                    progress?.Report(new UpdateProgress("验证并解压资源", completed, total));
+                    var unpacked = Path.Combine(work, package.Id); await ExtractPackageAsync(zipPath, unpacked, package, ct).ConfigureAwait(false); await CommitPackageAsync(unpacked, package, ct).ConfigureAwait(false);
+                }
             }
             ct.ThrowIfCancellationRequested();
             var packages = release.Packages.Select(p => new SnapshotPackage
@@ -276,6 +290,63 @@ public sealed class UpdateService : IDisposable
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
         }
+    }
+
+    private sealed record ReusedFile(ResourceFile File, string SourcePath);
+    private sealed record DownloadFile(ResourceFile File, ResourceFileArchive Archive);
+    private sealed record PackagePlan(bool UseFiles, List<ReusedFile> Reused, List<DownloadFile> Downloads, long DownloadBytes);
+
+    private async Task<PackagePlan> BuildPlanAsync(ResourcePackage package, CancellationToken ct)
+    {
+        if (package.FileArchives is null) return new(false, [], [], package.Size);
+        var sources = CandidateDirectories(package);
+        var reused = new List<ReusedFile>(); var downloads = new List<DownloadFile>();
+        var archives = package.FileArchives.ToDictionary(a => a.Path, StringComparer.OrdinalIgnoreCase);
+        foreach (var file in package.Files)
+        {
+            string? found = null;
+            foreach (var directory in sources)
+            {
+                var path = UpdateStorage.SafeChild(directory, file.Path);
+                try { await UpdateStorage.VerifyFileAsync(path, file, ct).ConfigureAwait(false); found = path; break; }
+                catch (InvalidDataException) { }
+                catch (IOException) { }
+            }
+            if (found is not null) reused.Add(new(file, found)); else downloads.Add(new(file, archives[file.Path]));
+        }
+        var bytes = downloads.Sum(d => d.Archive.Size);
+        return new(bytes < package.Size, reused, downloads, bytes);
+    }
+
+    private IEnumerable<string> CandidateDirectories(ResourcePackage package)
+    {
+        foreach (var p in _snapshots.Current.Packages.Where(p => p.Id == package.Id && p.Kind == package.Kind)) yield return p.Directory;
+        var bundled = _snapshots.Bundled.Packages.Where(p => p.Id == package.Id && p.Kind == package.Kind).Select(p => p.Directory);
+        foreach (var path in bundled) yield return path;
+        var root = Path.Combine(_snapshots.Root, "packages", package.Id);
+        if (Directory.Exists(root)) foreach (var path in Directory.EnumerateDirectories(root)) yield return path;
+    }
+
+    private async Task CommitPackageAsync(string unpacked, ResourcePackage package, CancellationToken ct)
+    {
+        var target = PackageDirectory(package); Directory.CreateDirectory(Path.GetDirectoryName(target)!); UpdateStorage.RejectLink(Path.GetDirectoryName(target)!); ct.ThrowIfCancellationRequested();
+        await UpdateStorage.WriteAsync(target + ".receipt.json", package, ct).ConfigureAwait(false); await UpdateStorage.MoveDirectoryAsync(unpacked, target, ct).ConfigureAwait(false);
+    }
+
+    private static async Task CopyLocalVerifiedAsync(string sourcePath, string targetPath, ResourceFile file, CancellationToken ct)
+    {
+        await using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var target = new FileStream(targetPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous);
+        await CopyVerifiedAsync(source, target, file.Size, file.Sha256, null, ct).ConfigureAwait(false);
+    }
+
+    private static async Task ExtractSingleFileAsync(string archivePath, string directory, ResourceFile file, CancellationToken ct)
+    {
+        using var archive = ZipFile.OpenRead(archivePath); var entries = ReadArchiveEntries(archive);
+        if (entries.Count != 1 || !entries.TryGetValue(file.Path, out var entry) || entry.Length != file.Size) throw new InvalidDataException("资源文件附件内容与清单不符。");
+        var target = UpdateStorage.SafeChild(directory, file.Path); Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        await using var source = entry.Open(); await using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, FileOptions.Asynchronous);
+        await CopyVerifiedAsync(source, output, file.Size, file.Sha256, null, ct).ConfigureAwait(false);
     }
 
     private SnapshotPackage? FindBundled(ResourcePackage package) => _snapshots.FindBundledPackage(new SnapshotPackage { Id = package.Id, Version = package.Version, Kind = package.Kind, Sha256 = package.Sha256, Files = package.Files });

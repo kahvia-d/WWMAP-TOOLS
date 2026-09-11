@@ -69,13 +69,13 @@ $appRoot = 'out/release-2026.9.9.4/IMao-v2026.9.9.4-windows-x64'
   --core-host "$appRoot/IMao-CoreHost.exe"
 ```
 
-`prepare` 生成 `update.json`、`packages/*.zip`、完整离线集合包、候选快照、原生检查日志及 `release-report.json`。它拒绝覆盖已有输出目录。ZIP 使用固定文件顺序与时间戳，包清单含每个文件大小和 SHA-256。生产准备必须通过实际 CoreHost `--check-resource-snapshot`。发布附件（包括离线集合与程序 ZIP）必须小于 2 GiB，工具超限即拒绝；规模超过此限时需先调整分发方案。[GitHub 附件限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)
+`prepare` 生成 `update.json`、`packages/*.zip`、按文件差量附件 `files/*.zip`、完整离线集合包、候选快照、原生检查日志及 `release-report.json`。它拒绝覆盖已有输出目录。ZIP 使用固定文件顺序与时间戳，包清单含每个文件大小和 SHA-256。整包 ZIP 之外，包内每个文件另生成内容寻址的单文件 ZIP：文件名包含文件内容哈希与路径摘要，两个字节相同但路径不同的文件不会共用附件，发布报告的 `fileAssets` 按附件字节去重后列出本 tag 需要上传的全部差量附件。生产准备必须通过实际 CoreHost `--check-resource-snapshot`。发布附件（包括离线集合与程序 ZIP）必须小于 2 GiB，工具超限即拒绝；规模超过此限时需先调整分发方案。[GitHub 附件限制](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases)
 
 暂存资源时核对地图数据与所选特征包的完整文件名清单。重复构建可沿用内容一致的输出目录；若源文件已删除而输出仍有旧文件，会停止并要求换用新的输出目录，保留旧文件，不自动删除或把旧资料签入新资源包。可执行 `scripts/Test-ResourceUpdateStaging.ps1 -OutputRoot out/staging-test-new-run` 检查 Windows PowerShell 5 的重复暂存和旧文件拒绝行为。
 
 暂存入口统一在 Windows PowerShell 5.1 中执行。即使从 PowerShell 7 的打包脚本调用，也会自动委派并保留参数和工作目录，保证程序内置数据与相同版本离线包逐字节一致，不受两种 PowerShell JSON 序列化差异影响。
 
-后续资源版本使用更高的 `--sequence` 与四段 `--resource-version`，通过 `--previous` 传入当前正式签名清单；可使用 `--notes-file`、`--min-app-version` 和 `--max-app-version`。内容完全相同的包沿用旧版本及下载地址，只发布变化包。不要给仅资源发布添加 `--program-release true`。保留其他仍受支持的基础资源版本在原清单中，`prepare` 自动保留其他基础资源的快照条目。
+后续资源版本使用更高的 `--sequence` 与四段 `--resource-version`，通过 `--previous` 传入当前正式签名清单；可使用 `--notes-file`、`--min-app-version` 和 `--max-app-version`。内容完全相同的包沿用旧版本及下载地址，只发布变化包。内容发生变化的包会附带包内每个文件的单文件下载描述（`fileArchives`），字节未变的文件沿用旧发行地址；新客户端安装时优先复用本机已验证文件（当前快照、内置资源或历史版本目录），只下载缺失或变化的文件。旧程序忽略这些描述，仍按整包下载，行为不变。不要给仅资源发布添加 `--program-release true`。保留其他仍受支持的基础资源版本在原清单中，`prepare` 自动保留其他基础资源的快照条目。
 
 ```powershell
 & $dotnet $publisher prepare --app-root $appRoot `
@@ -101,9 +101,9 @@ $appRoot = 'out/release-2026.9.9.4/IMao-v2026.9.9.4-windows-x64'
   -ProgramZip out/release-2026.9.9.1/IMao-v2026.9.9.1-windows-x64.zip
 ```
 
-脚本固定使用 `kahvia-d/WWMAP-TOOLS`：校验本地签名与文件 → 检查稳定清单序号 → 创建或复用草稿 → 上传缺少附件 → 下载核对草稿字节 → 发布 → 无认证公开下载核对 → 最后通过 GitHub 文件 API 更新 `updates/stable.json`，并回读核对。更新稳定清单使用旧文件 SHA，遇到并发发布会失败，重新读取并重新准备后再发布。相同名称的远端附件内容不同会拒绝覆盖；已发布版本缺附件也会拒绝补写。
+脚本固定使用 `kahvia-d/WWMAP-TOOLS`：校验本地签名与文件 → 检查稳定清单序号 → 创建或复用草稿 → 上传缺少附件（整包与 `files/` 按文件差量附件） → 下载核对草稿字节 → 发布 → 无认证公开下载核对 → 最后通过 GitHub 文件 API 更新 `updates/stable.json`，并回读核对。沿用旧发行地址的差量附件不会重复上传。更新稳定清单使用旧文件 SHA，遇到并发发布会失败，重新读取并重新准备后再发布。相同名称的远端附件内容不同会拒绝覆盖；已发布版本缺附件也会拒绝补写。
 
-创建草稿之前，还会比较已验证的线上稳定清单与候选清单：共同包 ID 与版本的归档哈希、大小、类型、完整文件清单必须一致；已有基础资源版本的条目不得丢失，程序版本不得倒退。忘记 `--previous` 时不能绕过这些检查。可执行 `scripts/Test-ResourceCatalogTransition.ps1 -OutputRoot out/catalog-transition-test-new-run` 运行本地清单迁移回归。
+创建草稿之前，还会比较已验证的线上稳定清单与候选清单：共同包 ID 与版本的归档哈希、大小、类型、完整文件清单及单文件下载描述必须一致；已有基础资源版本的条目不得丢失，程序版本不得倒退。忘记 `--previous` 时不能绕过这些检查。可执行 `scripts/Test-ResourceCatalogTransition.ps1 -OutputRoot out/catalog-transition-test-new-run` 运行本地清单迁移回归。
 
 如果附件上传或公开下载失败，稳定清单保持原值。排查网络后可对同一准备目录重试，不需要重新签名或替换已有资源。日志和验证输出留在准备目录，不记录私钥或认证令牌。清单推进之后客户端下次检查才会看见更新；已有运行实例仍固定使用当前快照。
 

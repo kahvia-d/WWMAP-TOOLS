@@ -39,6 +39,11 @@ foreach ($asset in $report.assets) {
     if (([Uri]$asset.url).AbsolutePath -notlike "/$repo/releases/download/$tag/*") { continue }
     $assets.Add([pscustomobject]@{path=(Join-Path $PreparedRoot "packages/$($asset.name)");name=$asset.name;sha256=$asset.sha256})
 }
+foreach ($asset in @($report.fileAssets)) {
+    # Content-addressed file archives may be referenced by a previous release.
+    if (([Uri]$asset.url).AbsolutePath -notlike "/$repo/releases/download/$tag/*") { continue }
+    $assets.Add([pscustomobject]@{path=(Join-Path $PreparedRoot "files/$($asset.name)");name=$asset.name;sha256=$asset.sha256})
+}
 $assets.Add([pscustomobject]@{path=$manifest;name='update.json';sha256=$report.signedManifestSha256})
 $assets.Add([pscustomobject]@{path=(Join-Path $PreparedRoot $report.offline.name);name=$report.offline.name;sha256=$report.offline.sha256})
 if ($ProgramZip) {

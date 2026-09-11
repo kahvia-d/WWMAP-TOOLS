@@ -69,6 +69,19 @@ public static class UpdateSignature
                     total = checked(total + file.Size);
                     if (total > 128L * 1024 * 1024 * 1024) throw new InvalidDataException("资源包展开大小过大。");
                 }
+                if (package.FileArchives is not null)
+                {
+                    if (package.FileArchives.Count != package.Files.Count) throw new InvalidDataException("资源文件下载描述不完整。");
+                    var expected = package.Files.ToDictionary(f => f.Path, StringComparer.OrdinalIgnoreCase);
+                    var described = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var archive in package.FileArchives)
+                    {
+                        UpdateStorage.ValidateRelativePath(archive.Path);
+                        ValidateUrl(archive.Url, asset: true);
+                        if (!described.Add(archive.Path) || !expected.ContainsKey(archive.Path) || archive.Size <= 0 || archive.Size > 64L * 1024 * 1024 * 1024 || !IsHash(archive.Sha256))
+                            throw new InvalidDataException("资源文件下载描述无效。");
+                    }
+                }
             }
             if (release.Packages.Count(p => p.Kind == "map-data") != 1) throw new InvalidDataException("资源快照必须包含一个完整地图数据包。");
         }

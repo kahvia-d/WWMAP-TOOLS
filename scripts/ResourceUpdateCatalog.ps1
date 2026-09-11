@@ -10,6 +10,16 @@ function Test-SameResourcePackageContent($Left, $Right) {
         $expected = $files[[string]$file.path]
         if ([long]$expected.size -ne [long]$file.size -or -not ([string]$expected.sha256).Equals([string]$file.sha256,[StringComparison]::OrdinalIgnoreCase)) { return $false }
     }
+    $leftArchives = @($Left.fileArchives)
+    $rightArchives = @($Right.fileArchives)
+    if ($leftArchives.Count -ne $rightArchives.Count) { return $false }
+    $archives = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    foreach ($archive in $leftArchives) { $archives.Add([string]$archive.path,$archive) }
+    foreach ($archive in $rightArchives) {
+        if (-not $archives.ContainsKey([string]$archive.path)) { return $false }
+        $expectedArchive = $archives[[string]$archive.path]
+        if ([long]$expectedArchive.size -ne [long]$archive.size -or -not ([string]$expectedArchive.sha256).Equals([string]$archive.sha256,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
     return $true
 }
 

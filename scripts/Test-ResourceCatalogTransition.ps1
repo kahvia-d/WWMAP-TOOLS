@@ -25,6 +25,10 @@ Expect-Rejection 'same package version with changed file hash rejected' {param($
 Expect-Rejection 'same package version with changed file size rejected' {param($c)$c.resources[0].packages[0].files[0].size=11}
 Expect-Rejection 'same package version with changed file path rejected' {param($c)$c.resources[0].packages[0].files[0].path='other.json'}
 Expect-Rejection 'same package version with missing file rejected' {param($c)$c.resources[0].packages[0].files=@()}
+$withFileArchive = Copy-Catalog $old
+$withFileArchive.resources[0].packages[0] | Add-Member -NotePropertyName fileArchives -NotePropertyValue @(@{path='points.json';size=30;sha256=('e'*64);url='https://github.com/kahvia-d/WWMAP-TOOLS/releases/download/fixture1/file-e.zip'})
+$archiveMutation = Copy-Catalog $withFileArchive; $archiveMutation.sequence = 2; $archiveMutation.resources[0].packages[0].fileArchives[0].sha256 = 'f'*64
+try { Assert-ResourceCatalogTransition $withFileArchive $archiveMutation; throw 'Expected rejection: same package version with changed file archive rejected' } catch { if ($_.Exception.Message -like 'Expected rejection:*') { throw }; $passed.Add('same package version with changed file archive rejected') }
 Expect-Rejection 'case and numeric version aliases cannot bypass immutability' {param($c)$c.resources[0].packages[0].id='MAP-DATA';$c.resources[0].packages[0].version='2026.09.09.01';$c.resources[0].packages[0].sha256='c'*64}
 Expect-Rejection 'existing baseline cannot be silently dropped' {param($c)$c.resources[0].baselineId='baseline2'}
 Expect-Rejection 'program downgrade caused by missing previous catalog rejected' {param($c)$c.app.version='2026.9.8.1'}

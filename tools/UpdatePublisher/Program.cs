@@ -186,8 +186,28 @@ static class Publisher
                 using var input = File.OpenRead(SafeFile(source, file.Path)); using var target = entry.Open(); input.CopyTo(target);
             }
         }
+        var fileArchives = new List<ResourceFileArchive>();
+        foreach (var file in manifest)
+        {
+            var sourceFile = SafeFile(source, file.Path);
+            // Content-addressed names allow unchanged files to remain at their
+            // previous Release URL even when the containing package changes.
+            // The path suffix prevents two equal byte streams at different paths
+            // from sharing a ZIP whose sole entry name would be wrong.
+            var pathHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(file.Path)))[..16].ToLowerInvariant();
+            var archiveName = "file-" + file.Sha256.ToLowerInvariant() + "-" + pathHash + ".zip";
+            var archivePath = Path.Combine(output, "files", archiveName);
+            if (!File.Exists(archivePath))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(archivePath)!);
+                using var archive = new ZipArchive(new FileStream(archivePath, FileMode.CreateNew), ZipArchiveMode.Create);
+                var entry = archive.CreateEntry(file.Path, CompressionLevel.Optimal); entry.LastWriteTime = ZipEpoch;
+                using var input = File.OpenRead(sourceFile); using var target = entry.Open(); input.CopyTo(target);
+            }
+            fileArchives.Add(new() { Path = file.Path, Url = baseUrl + "/" + archiveName, Size = new FileInfo(archivePath).Length, Sha256 = Hash(archivePath) });
+        }
         return new() { Id = package.Id, Version = package.Version, Kind = package.Kind, Url = baseUrl + "/" + name,
-            Size = new FileInfo(destination).Length, Sha256 = Hash(destination), Files = manifest };
+            Size = new FileInfo(destination).Length, Sha256 = Hash(destination), Files = manifest, FileArchives = fileArchives };
     }
     static void VerifyPackage(string file, ResourcePackage p)
     {
@@ -247,6 +267,12 @@ static class Publisher
             var prior = previous?.Resources.SelectMany(r => r.Packages).LastOrDefault(q => q.Id == p.Id);
             if (prior is not null && prior.Kind != p.Kind) throw new InvalidDataException("A package ID cannot change its resource kind.");
             var built = Package(source, output, p with { Version = version }, baseUrl);
+            if (prior?.FileArchives is not null)
+            {
+                var priorFiles = prior.FileArchives.ToDictionary(a => a.Path, StringComparer.OrdinalIgnoreCase);
+                built = built with { FileArchives = built.FileArchives!.Select(a =>
+                    priorFiles.TryGetValue(a.Path, out var old) && old.Sha256.Equals(a.Sha256, StringComparison.OrdinalIgnoreCase) && old.Size == a.Size ? old : a).ToList() };
+            }
             // Identical file bytes retain their old package identity and URL, enabling true differential updates.
             if (prior is not null && FileListsEqual(prior.Files, built.Files))
             {
@@ -256,7 +282,8 @@ static class Publisher
                 if (!string.Equals(generated, retained, StringComparison.OrdinalIgnoreCase)) File.Move(generated, retained);
                 built = prior;
             }
-            if (previous?.Resources.SelectMany(r => r.Packages).Any(q => q.Id == built.Id && q.Version == built.Version && q.Sha256 != built.Sha256) == true) throw new InvalidDataException("Package version reuse with different content is forbidden.");
+            var sameIdentity = previous?.Resources.SelectMany(r => r.Packages).FirstOrDefault(q => q.Id == built.Id && q.Version == built.Version);
+            if (sameIdentity is not null && (sameIdentity.Sha256 != built.Sha256 || !FileArchivesEqual(sameIdentity.FileArchives, built.FileArchives))) throw new InvalidDataException("Package version reuse with different content or file archives is forbidden.");
             packages.Add(built);
         }
         var release = new ResourceRelease { SnapshotId = "resources-" + version, Sequence = sequence, BaselineId = build.BaselineId,
@@ -287,6 +314,7 @@ static class Publisher
         WriteNew(signedFile, Sign(catalog, key, keyId));
         VerifyEnvelope(signedFile, keys, production);
         foreach (var p in packages) VerifyPackage(Path.Combine(output, "packages", $"{p.Id}-{p.Version}.zip"), p);
+        foreach (var archive in packages.SelectMany(p => p.FileArchives ?? []).Where(a => new Uri(a.Url).AbsolutePath.StartsWith(new Uri(baseUrl).AbsolutePath + "/", StringComparison.Ordinal))) VerifyFileArchive(Path.Combine(output, "files", Path.GetFileName(new Uri(archive.Url).AbsolutePath)), archive);
         // Validate source snapshot using the same native parser used by installed clients.
         var candidate = snapshot with { FormatVersion = 2, SnapshotId = release.SnapshotId, Sequence = sequence, Bundled = false,
             MinAppVersion = release.MinAppVersion, MaxAppVersion = release.MaxAppVersion,
@@ -320,10 +348,23 @@ static class Publisher
         WriteNew(Path.Combine(output, "release-report.json"), new { formatVersion = 1, production, sourceCommit = build.SourceCommit, sourceDirty, sourceTreeSha256, appVersion = build.AppVersion, baselineId = build.BaselineId,
             tag, sequence, snapshotId = release.SnapshotId, nativePassed, signedManifestSha256 = Hash(signedFile),
             assets = packages.Select(p => new { name = $"{p.Id}-{p.Version}.zip", sha256 = p.Sha256, size = p.Size, url = p.Url }).ToArray(),
+            fileAssets = packages.SelectMany(p => p.FileArchives ?? []).GroupBy(a => a.Sha256, StringComparer.OrdinalIgnoreCase).Select(g => new { name = Path.GetFileName(new Uri(g.First().Url).AbsolutePath), sha256 = g.First().Sha256, size = g.First().Size, url = g.First().Url }).ToArray(),
+            manifestBytes = new FileInfo(signedFile).Length,
             offline = new { name = Path.GetFileName(offline), size = new FileInfo(offline).Length, sha256 = Hash(offline) } });
         Console.WriteLine($"Prepared {packages.Count} signed resource packages, offline archive and validation report. No remote publication occurred.");
     }
+    static void VerifyFileArchive(string path, ResourceFileArchive archive)
+    {
+        if (new FileInfo(path).Length != archive.Size || !string.Equals(Hash(path), archive.Sha256, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("File archive hash or size mismatch.");
+        using var zip = ZipFile.OpenRead(path);
+        if (zip.Entries.Count != 1 || zip.Entries[0].FullName != archive.Path) throw new InvalidDataException("File archive has an unexpected entry.");
+    }
     static bool FileListsEqual(List<ResourceFile> a, List<ResourceFile> b) => a.Count == b.Count && a.OrderBy(x => x.Path, StringComparer.Ordinal).SequenceEqual(b.OrderBy(x => x.Path, StringComparer.Ordinal));
+    static bool FileArchivesEqual(List<ResourceFileArchive>? a, List<ResourceFileArchive>? b)
+    {
+        if (a is null || b is null) return a is null && b is null;
+        return a.Count == b.Count && a.OrderBy(x => x.Path, StringComparer.Ordinal).Select(x => (x.Path, x.Size, x.Sha256)).SequenceEqual(b.OrderBy(x => x.Path, StringComparer.Ordinal).Select(x => (x.Path, x.Size, x.Sha256)));
+    }
     static void AddFile(ZipArchive zip, string source, string name, CompressionLevel compression)
     {
         var entry = zip.CreateEntry(name, compression); entry.LastWriteTime = ZipEpoch;
